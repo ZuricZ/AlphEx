@@ -1,3 +1,4 @@
+import warnings
 from typing import Any, Literal
 from functools import partial
 
@@ -305,7 +306,7 @@ def compute_conditional_expectation_quantile(
         n_quantiles: int | None = 20,
         q_clip: int = 0,
         binning: Literal["global", "cross_sectional", "grouped"] = "global",
-        agg_time: bool = True,
+        # agg_time: bool = True,
         agg_cross: bool = True,
         by_group: bool = False,
         asset: str | None = None,
@@ -332,8 +333,6 @@ def compute_conditional_expectation_quantile(
         Number of bins to exclude from each tail to reduce outlier influence.
     binning : Literal["global", "cross_sectional", "grouped"]
         Binning to use for x_col.
-    agg_time : bool
-        If True, aggregate across the time axis (e.g., by date) for each bin.
     agg_cross : bool
         If True, compute within-date bin means and then aggregate across time.
     by_group : bool
@@ -351,6 +350,13 @@ def compute_conditional_expectation_quantile(
         raise ValueError("Specify only one of `n_bins` or `n_quantiles`.")
     if binning not in {"global", "cross_sectional", "grouped"}:
         raise ValueError("`binning` must be one of {'global', 'cross_sectional', 'grouped'}.")
+    if asset is not None:
+        if agg_cross:
+            warnings.warn("agg_cross=True ignored for single asset mode.")
+            agg_cross = False
+        if binning != "global":
+            warnings.warn("Switching to global binning for single asset mode.")
+            binning = "global"
 
     def assign_bins(data: pd.DataFrame) -> pd.Series:
         if n_quantiles is not None:
@@ -361,7 +367,7 @@ def compute_conditional_expectation_quantile(
             raise ValueError("Specify either `n_bins` or `n_quantiles`.")
 
     def compute_for_subset(sub_df: pd.DataFrame, label: str) -> pd.DataFrame:
-        df_work = sub_df[[x_col, y_col]].dropna()
+        df_work = sub_df[[x_col, y_col, group_col]].dropna()
 
         # Ensure date index for CS aggregation
         if (agg_cross or binning == "cross_sectional") and 'date' not in df_work.index.names:
@@ -372,34 +378,29 @@ def compute_conditional_expectation_quantile(
 
         # Assign bins
         if binning == "cross_sectional":
-            df_work['bin'] = df_work.groupby('date', group_keys=False).apply(assign_bins)
+            df_work['bin'] = df_work.groupby('date', group_keys=False, observed=True).apply(assign_bins)
         elif binning == "grouped":
             if group_col not in df_work.columns:
                 raise ValueError(f"Missing column '{group_col}' for grouped binning.")
-            df_work['bin'] = df_work.groupby(group_col, group_keys=False).apply(assign_bins)
+            df_work['bin'] = df_work.groupby(group_col, group_keys=False, observed=True).apply(assign_bins)
         else:  # global
             df_work['bin'] = assign_bins(df_work)
 
         # Cross-sectional (e.g. by date) aggregation
         if agg_cross:
             # Group by date, then bin within each date
-            daily = df_work.groupby('date').apply(
-                lambda g: g.groupby('bin', observed=True)[y_col].mean()
-            )  # TODO: Does aggregation type even matter?!
-            daily.index = daily.index.droplevel(0)
-
-            if not agg_time:
-                raise NotImplementedError("agg_cross=True and agg_time=False not implemented.")
-
-            stats = daily.groupby('bin', observed=True).agg(['mean', 'std', 'count'])
-            stats['sem'] = stats['std'] / np.sqrt(stats['count'])
-            stats = stats['mean'].to_frame('mean').assign(sem=stats['sem'])
-        else:
-            stats = (
-                df_work.groupby('bin', observed=True)[y_col]
-                .agg(['mean', 'std', 'count'])
-                .assign(sem=lambda x: x['std'] / np.sqrt(x['count']))
+            df_work = (
+                df_work.groupby('date')
+                .apply(lambda g: g.groupby('bin', observed=True)[y_col].mean())
+                .reset_index(level=0, drop=True)
+                .to_frame(name=y_col)
             )
+
+        stats = (
+            df_work.groupby('bin', observed=True)[y_col]
+            .agg(['mean', 'std', 'count'])
+            .assign(sem=lambda x: x['std'] / np.sqrt(x['count']))
+        )
 
         stats['x_mid'] = stats.index.map(lambda b: b.mid)
         stats['group'] = label
