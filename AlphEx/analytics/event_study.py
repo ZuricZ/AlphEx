@@ -304,7 +304,7 @@ def compute_conditional_expectation_quantile(
         n_bins: int | None = None,
         n_quantiles: int | None = 20,
         q_clip: int = 0,
-        binning: Literal["global", "cross_sectional", "grouped"] = "cross_sectional",
+        binning: Literal["global", "cross_sectional", "grouped"] = "global",
         agg_time: bool = True,
         agg_cross: bool = True,
         by_group: bool = False,
@@ -349,44 +349,57 @@ def compute_conditional_expectation_quantile(
 
     if (n_bins is not None) and (n_quantiles is not None):
         raise ValueError("Specify only one of `n_bins` or `n_quantiles`.")
+    if binning not in {"global", "cross_sectional", "grouped"}:
+        raise ValueError("`binning` must be one of {'global', 'cross_sectional', 'grouped'}.")
+
+    def assign_bins(data: pd.DataFrame) -> pd.Series:
+        if n_quantiles is not None:
+            return pd.qcut(data[x_col], q=n_quantiles, duplicates='drop')
+        elif n_bins is not None:
+            return pd.cut(data[x_col], bins=n_bins)
+        else:
+            raise ValueError("Specify either `n_bins` or `n_quantiles`.")
 
     def compute_for_subset(sub_df: pd.DataFrame, label: str) -> pd.DataFrame:
         df_work = sub_df[[x_col, y_col]].dropna()
 
-        # Binning logic
-        if n_quantiles is not None:
-            df_work['bin'] = pd.qcut(df_work[x_col], q=n_quantiles, duplicates='drop')
-        elif n_bins is not None:
-            df_work['bin'] = pd.cut(df_work[x_col], bins=n_bins)
-        else:
-            raise ValueError("Specify either n_bins or n_quantiles.")
+        # Ensure date index for CS aggregation
+        if (agg_cross or binning == "cross_sectional") and 'date' not in df_work.index.names:
+            if 'date' in df_work.columns:
+                df_work = df_work.set_index('date')
+            else:
+                raise ValueError("Missing 'date' column for cross-sectional processing.")
+
+        # Assign bins
+        if binning == "cross_sectional":
+            df_work['bin'] = df_work.groupby('date', group_keys=False).apply(assign_bins)
+        elif binning == "grouped":
+            if group_col not in df_work.columns:
+                raise ValueError(f"Missing column '{group_col}' for grouped binning.")
+            df_work['bin'] = df_work.groupby(group_col, group_keys=False).apply(assign_bins)
+        else:  # global
+            df_work['bin'] = assign_bins(df_work)
 
         # Cross-sectional (e.g. by date) aggregation
         if agg_cross:
-            if 'date' not in df_work.index.names and 'date' in df_work.columns:
-                df_work = df_work.set_index('date')
-            if 'date' not in df_work.index.names:
-                raise ValueError("Data must have 'date' as index or column for agg_cross=True.")
-
-            def daily_bin_means(grp):
-                return grp.groupby('bin', observed=True)[y_col].mean()
-
             # Group by date, then bin within each date
-            daily = df_work.groupby('date').apply(daily_bin_means)
+            daily = df_work.groupby('date').apply(
+                lambda g: g.groupby('bin', observed=True)[y_col].mean()
+            )  # TODO: Does aggregation type even matter?!
             daily.index = daily.index.droplevel(0)
 
-            if agg_time:
-                stats = daily.groupby('bin', observed=True).agg(['mean', 'std', 'count'])
-                stats['sem'] = stats[('mean', 'std')] / np.sqrt(stats[('mean', 'count')])
-                stats = stats[('mean', 'mean')].to_frame('mean').assign(sem=stats['sem'])
-            else:
+            if not agg_time:
                 raise NotImplementedError("agg_cross=True and agg_time=False not implemented.")
+
+            stats = daily.groupby('bin', observed=True).agg(['mean', 'std', 'count'])
+            stats['sem'] = stats['std'] / np.sqrt(stats['count'])
+            stats = stats['mean'].to_frame('mean').assign(sem=stats['sem'])
         else:
             stats = (
                 df_work.groupby('bin', observed=True)[y_col]
                 .agg(['mean', 'std', 'count'])
+                .assign(sem=lambda x: x['std'] / np.sqrt(x['count']))
             )
-            stats['sem'] = stats['std'] / np.sqrt(stats['count'])
 
         stats['x_mid'] = stats.index.map(lambda b: b.mid)
         stats['group'] = label
